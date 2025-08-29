@@ -1,0 +1,202 @@
+Spell - Gerenciador de Programas Source-Based para Linux From Scratch
+=====================================================================
+
+Este documento é um tutorial completo para instalar, configurar e usar o spell,
+um gerenciador de pacotes baseado em fontes (source-based) para sistemas Linux From Scratch (LFS).
+
+---------------------------------------------------------------------
+1. Instalação e Dependências
+---------------------------------------------------------------------
+
+Dependências obrigatórias do sistema:
+
+- Python 3.8+
+- pip install pyyaml (biblioteca Python para YAML)
+- curl
+- git
+- tar
+- unzip
+- patch
+
+Dependências opcionais:
+- 7z (para descompactar pacotes 7zip)
+- fakeroot (para simular permissões de root na instalação)
+
+---------------------------------------------------------------------
+2. Estrutura de Diretórios
+---------------------------------------------------------------------
+
+Por padrão o spell usa os seguintes diretórios em:
+
+~/.local/share/spell/
+
+- recipes/  → repositório git contendo as receitas em YAML
+- work/     → diretórios temporários de compilação
+- pkgs/     → pacotes empacotados (.tar.zst) antes da instalação
+- logs/     → logs de build/instalação
+- db.json   → banco de dados de pacotes instalados
+
+Pode-se alterar com variáveis de ambiente:
+
+- SPELL_HOME
+- SPELL_RECIPES
+- SPELL_WORK
+- SPELL_PKGS
+- SPELL_LOGS
+- SPELL_DB
+
+---------------------------------------------------------------------
+3. Uso Básico
+---------------------------------------------------------------------
+
+- spell.py search <regex>       → procura pacotes no repositório de receitas
+- spell.py list                 → lista pacotes instalados
+- spell.py info <pacote>        → mostra informações da receita e versão instalada
+- spell.py build <pacote>       → compila sem instalar
+- spell.py install <pacote>     → compila e instala
+- spell.py remove <pacote>      → desinstala (checando dependências reversas)
+- spell.py upgrade <pacote>     → atualiza pacote
+- spell.py upgrade --all        → atualiza todos os pacotes
+- spell.py sync                 → sincroniza as receitas (git pull)
+- spell.py clean <pacote>|--all → remove diretórios de trabalho
+- spell.py orphans              → mostra pacotes órfãos
+
+---------------------------------------------------------------------
+4. Estrutura de uma Receita YAML
+---------------------------------------------------------------------
+
+Exemplo simples:
+
+---
+name: zlib
+version: 1.3.1
+vars:
+  URL: https://zlib.net/zlib-${version}.tar.xz
+source:
+  - type: curl
+    url: ${URL}
+    hash: sha256:xxxxxxxxxxxxxxxxxxxx
+build:
+  - ./configure --prefix=/usr
+  - make -j$(nproc)
+install:
+  - make DESTDIR=${DESTDIR} install
+runtime_deps: []
+build_deps: []
+provides: [zlib]
+
+---------------------------------------------------------------------
+5. Exemplos Completos de Receitas
+---------------------------------------------------------------------
+
+### 5.1. Receita do GCC
+
+---
+name: gcc
+version: 13.2.0
+vars:
+  URL: https://ftp.gnu.org/gnu/gcc/gcc-${version}/gcc-${version}.tar.xz
+source:
+  - type: curl
+    url: ${URL}
+    hash: sha256:xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+patches: []
+build:
+  - ./contrib/download_prerequisites
+  - mkdir -v build && cd build && ../configure --prefix=/usr --disable-multilib --enable-languages=c,c++
+  - cd build && make -j$(nproc)
+install:
+  - cd build && make DESTDIR=${DESTDIR} install
+runtime_deps: [glibc]
+build_deps: [binutils, gmp, mpfr, mpc]
+provides: [gcc, g++]
+
+### 5.2. Receita da GLIBC
+
+---
+name: glibc
+version: 2.39
+vars:
+  URL: https://ftp.gnu.org/gnu/libc/glibc-${version}.tar.xz
+source:
+  - type: curl
+    url: ${URL}
+    hash: sha256:xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+patches: []
+build:
+  - mkdir -v build && cd build && ../configure --prefix=/usr
+  - cd build && make -j$(nproc)
+install:
+  - cd build && make DESTDIR=${DESTDIR} install
+runtime_deps: []
+build_deps: [gcc]
+provides: [glibc]
+
+### 5.3. Receita do Firefox
+
+---
+name: firefox
+version: 128.0
+vars:
+  URL: https://ftp.mozilla.org/pub/firefox/releases/${version}/source/firefox-${version}.source.tar.xz
+source:
+  - type: curl
+    url: ${URL}
+    hash: sha256:xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+patches: []
+build:
+  - ./mach bootstrap --application-choice=browser
+  - ./mach build -j$(nproc)
+install:
+  - ./mach install --destdir=${DESTDIR}
+runtime_deps: [glibc, gtk3, dbus, alsa-lib]
+build_deps: [gcc, python3, rust, nodejs]
+provides: [firefox]
+
+---------------------------------------------------------------------
+6. Fluxo Típico de Uso
+---------------------------------------------------------------------
+
+1. Criar ou clonar repositório de receitas:
+
+mkdir -p ~/.local/share/spell/recipes
+cd ~/.local/share/spell/recipes
+git init
+
+2. Adicionar receitas (como gcc.yml, glibc.yml, firefox.yml).
+
+3. Instalar pacotes:
+
+./spell.py install gcc
+./spell.py install glibc
+./spell.py install firefox
+
+4. Listar pacotes instalados:
+
+./spell.py list
+
+5. Procurar pacotes:
+
+./spell.py search fire
+
+6. Atualizar todos os pacotes:
+
+./spell.py upgrade --all
+
+7. Remover pacotes:
+
+./spell.py remove firefox
+
+8. Ver pacotes órfãos:
+
+./spell.py orphans
+
+---------------------------------------------------------------------
+7. Considerações Finais
+---------------------------------------------------------------------
+
+O spell é um protótipo avançado de gerenciador de pacotes source-based,
+inspirado em ferramentas como Gentoo Portage, Exherbo Paludis e Sorcery do Source Mage.
+Ele é adequado para aprendizado, experimentação e construção de sistemas Linux From Scratch.
+
+Use com cautela em sistemas de produção.
