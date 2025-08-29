@@ -1,0 +1,2 @@
+# Spell
+Gerenciador de programas 
