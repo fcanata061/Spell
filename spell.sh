@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# spell — um gerenciador de programas simples para LFS
+# spell — um gerenciador de programas simples para LFS/ports
 # Licença: MIT
 # Requisitos: bash 4+, coreutils, curl, git, tar, xz, unzip, gzip, bzip2, zstd, patch, sha256sum,
-#              rsync, fakeroot (opcional mas recomendado), jq (opcional para saída bonita)
+#             rsync, fakeroot (opcional mas recomendado), jq (opcional p/ saída)
 # Testado: Linux base, sem systemd dependente. Use por sua conta e risco.
 
 set -euo pipefail
 IFS=$'\n\t'
 
-VERSION="0.1.0"
+VERSION="0.2.0"
 
 ########################################
 # Configuração
@@ -21,13 +21,18 @@ VERSION="0.1.0"
 : "${SPELL_SRC:=$SPELL_HOME/src}"                                 # downloads originais
 : "${SPELL_BINREPO:=$SPELL_HOME/binrepo}"                         # pacotes binários construídos (tar)
 : "${SPELL_LOGS:=$SPELL_HOME/logs}"                               # logs de build/install
-: "${SPELL_DB:=$SPELL_HOME/db}"                                   # base instalada
+: "${SPELL_DB:=$SPELL_HOME/db}"                                   # base instalada (metadados + files)
 : "${SPELL_HOOKS:=$SPELL_ETC/hooks}"                              # hooks (pre-install, post-remove, etc)
 : "${SPELL_COLOR:=1}"
 : "${SPELL_SPINNER:=1}"
 
 mkdir -p "$SPELL_HOME" "$SPELL_ETC" "$SPELL_REPO" "$SPELL_FORMULAE" \
          "$SPELL_WORK" "$SPELL_SRC" "$SPELL_BINREPO" "$SPELL_LOGS" "$SPELL_DB" "$SPELL_HOOKS"
+
+# Lock global para evitar concorrência
+LOCKFILE="$SPELL_HOME/.lock"
+exec 9>"$LOCKFILE"
+flock -n 9 || { echo "Outra instância do spell está rodando (lock: $LOCKFILE)" >&2; exit 1; }
 
 ########################################
 # Utilidades: cores, spinner, log
@@ -52,9 +57,11 @@ start_spinner() {
   ( while :; do for ((i=0;i<${#chars};i++)); do printf "\r%s" "${chars:i:1}"; sleep 0.08; done; done ) &
   SP_PID=$!
 }
-stop_spinner() { [[ -n ${SP_PID} ]] && { kill "$SP_PID" >/dev/null 2>&1 || true; printf "\r \\r"; SP_PID=""; }; }
+stop_spinner() { [[ -n ${SP_PID} ]] && { kill "$SP_PID" >/dev/null 2>&1 || true; printf "\r \r"; SP_PID=""; }; }
 
 logfile() { mkdir -p "$SPELL_LOGS/$1"; printf "%s/%s/%s.log" "$SPELL_LOGS" "$1" "$(date +%Y%m%d-%H%M%S)"; }
+
+have() { command -v "$1" >/dev/null 2>&1; }
 
 ########################################
 # Formato de fórmula (*.spell)
@@ -62,8 +69,8 @@ logfile() { mkdir -p "$SPELL_LOGS/$1"; printf "%s/%s/%s.log" "$SPELL_LOGS" "$1" 
 #   NAME, VERSION, RELEASE (opcional), URL (tarball) OU GIT (url,branch,commit)
 #   SHA256 (tarball), DEPENDS=(...) opcional
 #   PATCHES=( local/dir/*.patch | http(s):// | git:// ) opcional
-#   BUILD() { ./configure --prefix=/usr; make; }  (obrigatório)
-#   INSTALL() { make DESTDIR="$DESTDIR" install; } (opcional; padrão roda "make DESTDIR install")
+#   BUILD() { ./configure --prefix=/usr; make; }  (obrigatório ou default)
+#   INSTALL() { make DESTDIR="$DESTDIR" install; } (opcional; default faz isso)
 #   STRIP_BINARIES=1 (padrão 1)
 ########################################
 
@@ -72,19 +79,22 @@ load_formula() {
   [[ -f "$path" ]] || { err "Fórmula não encontrada: $name ($path)"; exit 1; }
   # shellcheck disable=SC1090
   source "$path"
-  : "${NAME:?defina NAME}"; : "${VERSION:?defina VERSION}"
-  : "${RELEASE:=1}"; : "${DEPENDS:=()}"; : "${STRIP_BINARIES:=1}"
+  : "${NAME:?defina NAME na fórmula}"; : "${VERSION:?defina VERSION}"; : "${RELEASE:=1}"
+  : "${DEPENDS:=()}"; : "${STRIP_BINARIES:=1}"
 }
 
-formula_field() { # imprime um campo da fórmula sem carregar tudo
+# Extrai um campo simples sem executar a fórmula (uso: formula_field pkg VERSION)
+formula_field() {
   local name="$1" field="$2"; local path="$SPELL_FORMULAE/$name.spell"
   [[ -f "$path" ]] || return 1
-  # usar grep sed simples (não executa)
-  awk -v f="$field" 'BEGIN{IGNORECASE=0}
-    $1==f {
-      sub(/^.*=\(/, ""); sub(/\).*/, ""); print; exit
+  awk -v f="$field" '
+    $1==f && $2=="=" {
+      # linha tipo: FIELD=valor
+      sub(/^[^=]+= */, "", $0); gsub(/^"|"$/, "", $0); print $0; exit
     }
-    match($0, "^"f"=\"[^\"]*\"") { s=$0; sub(/^"f"=\"/, "", s); sub(/\"$/, "", s); print s; exit }
+    match($0, "^"f"=\"[^\"]*\"") {
+      s=$0; sub(/^"f"=\"/, "", s); sub(/\".*/, "", s); print s; exit
+    }
   ' "$path"
 }
 
@@ -92,14 +102,14 @@ formula_field() { # imprime um campo da fórmula sem carregar tudo
 # Resolução de dependências (topo + reverse)
 ########################################
 
-# topo_order <alvos...> -> escreve ordem com dependências primeiro
-
 topo_order() {
   declare -A seen; declare -a order
   local visit
   visit() {
-    local pkg="$1"; [[ -n ${seen[$pkg]:-} ]] && return 0; seen[$pkg]=visiting
-    load_formula "$pkg" >/dev/null 2>&1 || { err "Fórmula $pkg ausente"; exit 1; }
+    local pkg="$1"
+    [[ -n ${seen[$pkg]:-} ]] && { [[ ${seen[$pkg]} == done ]] || true; return 0; }
+    seen[$pkg]=visiting
+    load_formula "$pkg" >/dev/null 2>&1 || { err "Fórmula ausente: $pkg"; exit 1; }
     local d
     for d in "${DEPENDS[@]:-}"; do visit "$d"; done
     seen[$pkg]=done; order+=("$pkg")
@@ -109,7 +119,6 @@ topo_order() {
   printf "%s\n" "${order[@]}"
 }
 
-# reverse_topo_order: dependentes primeiro (útil para remoção)
 reverse_topo_order() { mapfile -t _o < <(topo_order "$@"); tac <<<"${_o[*]}" | tr ' ' '\n'; }
 
 ########################################
@@ -128,7 +137,8 @@ fetch_source() {
       info "Usando cache: $fname"
     fi
     if [[ -n ${SHA256:-} ]]; then
-      (cd "$(dirname "$fname")" && echo "$SHA256  $(basename "$fname")" | sha256sum -c -) || { err "sha256 inválido"; exit 1; }
+      (cd "$(dirname "$fname")" && echo "$SHA256  $(basename "$fname")" | sha256sum -c -) \
+        || { err "sha256 inválido para $fname"; exit 1; }
     fi
     echo "$fname"
   elif [[ -n ${GIT:-} ]]; then
@@ -136,19 +146,22 @@ fetch_source() {
     if [[ ! -d "$dest/.git" ]]; then
       info "Clonando $GIT"
       git clone --depth=1 ${GIT_BRANCH:+-b "$GIT_BRANCH"} "$GIT" "$dest"
+      [[ -n ${GIT_COMMIT:-} ]] && (cd "$dest" && git reset --hard "$GIT_COMMIT")
     else
       info "Atualizando git: $dest"
       (cd "$dest" && git fetch --all --tags && git reset --hard ${GIT_COMMIT:-origin/${GIT_BRANCH:-HEAD}})
     fi
     echo "$dest"
   else
-    err "Defina URL ou GIT em $name"; exit 1
+    err "Defina URL ou GIT na fórmula $name"; exit 1
   fi
 }
 
 ########################################
 # Descompactação para diretório de trabalho
 ########################################
+
+tar_supports_zstd() { tar --help 2>&1 | grep -q -- '--zstd'; }
 
 unpack_to_workdir() {
   local name="$1"; load_formula "$name"
@@ -163,8 +176,14 @@ unpack_to_workdir() {
       *.tar.gz|*.tgz)   tar -C "$wdir" --strip-components=1 -xzf "$src";;
       *.tar.bz2|*.tbz2) tar -C "$wdir" --strip-components=1 -xjf "$src";;
       *.tar.xz)         tar -C "$wdir" --strip-components=1 -xJf "$src";;
-      *.tar.zst|*.tar.zstd) tar -C "$wdir" --strip-components=1 --zstd -xf "$src";;
-      *.zip)            unzip -q "$src" -d "$wdir" && _first=$(find "$wdir" -mindepth 1 -maxdepth 1 -type d | head -n1) && [[ -n $_first ]] && rsync -a "$wdir/""$_first"/ "$wdir/" && rm -rf "$wdir"/"$_first";;
+      *.tar.zst|*.tar.zstd)
+        if tar_supports_zstd; then tar -C "$wdir" --strip-components=1 --zstd -xf "$src"
+        else unzstd -c "$src" | tar -C "$wdir" --strip-components=1 -xf -; fi ;;
+      *.zip)
+        unzip -q "$src" -d "$wdir"
+        local first; first=$(find "$wdir" -mindepth 1 -maxdepth 1 -type d | head -n1 || true)
+        [[ -n ${first:-} ]] && rsync -a "$first"/ "$wdir"/ && rm -rf "$first"
+        ;;
       *.tar)            tar -C "$wdir" --strip-components=1 -xf "$src";;
       *) err "Formato não suportado: $src"; exit 1;;
     esac
@@ -186,9 +205,11 @@ apply_patches() {
     if [[ -d "$p" ]]; then
       for f in "$p"/*.patch; do [[ -e "$f" ]] || continue; info "patch < $(basename "$f")"; patch -p1 < "$f"; done
     elif [[ "$p" =~ ^https?:// ]]; then
-      tmp=$(mktemp); curl -L --fail -o "$tmp" "$p"; info "patch < $(basename "$p")"; patch -p1 < "$tmp"; rm -f "$tmp"
+      local tmp; tmp=$(mktemp); curl -L --fail -o "$tmp" "$p"; info "patch < $(basename "$p")"; patch -p1 < "$tmp"; rm -f "$tmp"
     elif [[ "$p" =~ ^git://|^https?://.*\.git$ ]]; then
-      tmpdir=$(mktemp -d); git clone --depth=1 "$p" "$tmpdir"; for f in "$tmpdir"/*.patch; do [[ -e "$f" ]] || continue; info "patch < $(basename "$f")"; patch -p1 < "$f"; done; rm -rf "$tmpdir"
+      local tmpdir; tmpdir=$(mktemp -d); git clone --depth=1 "$p" "$tmpdir"
+      for f in "$tmpdir"/*.patch; do [[ -e "$f" ]] || continue; info "patch < $(basename "$f")"; patch -p1 < "$f"; done
+      rm -rf "$tmpdir"
     elif [[ -f "$p" ]]; then
       info "patch < $(basename "$p")"; patch -p1 < "$p"
     else
@@ -217,14 +238,14 @@ build_package() {
       BUILD
     else
       ./configure --prefix=/usr
-      make -j"${MAKEFLAGS_JOBS:-$(nproc || echo 1)}"
+      make -j"${MAKEFLAGS_JOBS:-$(nproc 2>/dev/null || echo 1)}"
     fi
     if declare -F INSTALL >/dev/null; then
       INSTALL
     else
       make DESTDIR="$DESTDIR" install
     fi
-    if [[ ${STRIP_BINARIES} -eq 1 ]]; then
+    if [[ ${STRIP_BINARIES} -eq 1 ]] && have strip; then
       find "$DESTDIR" -type f -perm -111 -exec strip --strip-unneeded {} + 2>/dev/null || true
     fi
   } &>"$log"
@@ -239,55 +260,21 @@ make_binary() {
   local DESTDIR; DESTDIR=$(build_package "$name")
   local out="$SPELL_BINREPO/${NAME}-${VERSION}-${RELEASE}.tar.zst"
   info "Gerando binário: $(basename "$out")"
-  (cd "$DESTDIR" && tar --zstd -cf "$out" .)
+  if tar_supports_zstd; then
+    (cd "$DESTDIR" && tar --zstd -cf "$out" .)
+  else
+    (cd "$DESTDIR" && tar -cf - . | zstd -T0 -q -o "$out")
+  fi
   # manifest
-  tar -tf "$out" | sort > "$SPELL_BINREPO/${NAME}-${VERSION}-${RELEASE}.manifest"
+  if tar_supports_zstd; then
+    tar -tf "$out" | sort > "$SPELL_BINREPO/${NAME}-${VERSION}-${RELEASE}.manifest"
+  else
+    zstd -d -c "$out" | tar -tf - | sort > "$SPELL_BINREPO/${NAME}-${VERSION}-${RELEASE}.manifest"
+  fi
   ok "Binário criado em $out"
   echo "$out"
 }
 
-install_binary() {
-  local tarball="$1"; local name ver rel
-  name=$(basename "$tarball" | sed -E 's/^([^/]+)-([^-]+)-([0-9]+)\.tar\.(zst|xz|gz)$/\1/')
-  ver=$(basename "$tarball" | sed -E 's/^([^/]+)-([^-]+)-([0-9]+)\.tar\.(zst|xz|gz)$/\2/')
-  rel=$(basename "$tarball" | sed -E 's/^([^/]+)-([^-]+)-([0-9]+)\.tar\.(zst|xz|gz)$/\3/')
-  local log; log=$(logfile "$name")
-  info "Instalando $name-$ver-$rel (log: $log)"
-  start_spinner
-  {
-    local tmp; tmp=$(mktemp -d)
-    case "$tarball" in
-      *.tar.zst|*.tar.zstd) tar -C "$tmp" --zstd -xf "$tarball";;
-      *.tar.xz) tar -C "$tmp" -xJf "$tarball";;
-      *.tar.gz|*.tgz) tar -C "$tmp" -xzf "$tarball";;
-      *.tar) tar -C "$tmp" -xf "$tarball";;
-      *) err "Formato binário não suportado: $tarball"; exit 1;;
-    esac
-    if command -v fakeroot >/dev/null; then
-      fakeroot rsync -aH --delete-after "$tmp"/ /
-    else
-      rsync -aH --delete-after "$tmp"/ /
-    fi
-    rm -rf "$tmp"
-    mkdir -p "$SPELL_DB/$name"
-    printf "%s\n" "$ver" > "$SPELL_DB/$name/version"
-    printf "%s\n" "$rel" > "$SPELL_DB/$name/release"
-    tar -tf "$tarball" | sed 's#^#/#' > "$SPELL_DB/$name/files"
-    date -u +%FT%TZ > "$SPELL_DB/$name/installed_at"
-  } &>"$log"
-  stop_spinner
-  ok "Instalado: $name-$ver ($rel)"
-  run_hook pre-install "$name" || true  # compat: disparado antes do registro final é difícil; chamamos aqui tb
-  run_hook post-install "$name" || true
-}
-
-install_from_source() {
-  local name="$1"; local bin; bin=$(make_binary "$name"); install_binary "$bin"
-}
-
-########################################
-# Hooks
-########################################
 run_hook() {
   local stage="$1"; local name="$2"
   local hook="$SPELL_HOOKS/$stage"
@@ -295,6 +282,68 @@ run_hook() {
     info "Hook: $stage"
     NAME="$name" SPELL_HOME="$SPELL_HOME" SPELL_DB="$SPELL_DB" "$hook" || warn "Hook $stage falhou"
   fi
+}
+
+_install_tree_into_root() {
+  # copia de tmpdir para /
+  local from="$1"
+  if have fakeroot; then
+    fakeroot rsync -aH --delete-after "$from"/ /
+  else
+    rsync -aH --delete-after "$from"/ /
+  fi
+}
+
+install_binary() {
+  local tarball="$1"; local name ver rel
+  name=$(basename "$tarball" | sed -E 's/^([^/]+)-([^-]+)-([0-9]+)\.tar\.(zst|xz|gz)$/\1/')
+  ver=$(basename "$tarball" | sed -E 's/^([^/]+)-([^-]+)-([0-9]+)\.tar\.(zst|xz|gz)$/\2/')
+  rel=$(basename "$tarball" | sed -E 's/^([^/]+)-([^-]+)-([0-9]+)\.tar\.(zst|xz|gz)$/\3/')
+  [[ -n "$name" && -n "$ver" && -n "$rel" ]] || { err "Nome de pacote inválido: $(basename "$tarball")"; exit 1; }
+  local log; log=$(logfile "$name")
+  info "Instalando $name-$ver-$rel (log: $log)"
+  start_spinner
+  {
+    run_hook pre-install "$name" || true
+
+    local tmp; tmp=$(mktemp -d)
+    case "$tarball" in
+      *.tar.zst|*.tar.zstd)
+        if tar_supports_zstd; then tar -C "$tmp" --zstd -xf "$tarball"
+        else zstd -d -c "$tarball" | tar -C "$tmp" -xf -; fi ;;
+      *.tar.xz) tar -C "$tmp" -xJf "$tarball";;
+      *.tar.gz|*.tgz) tar -C "$tmp" -xzf "$tarball";;
+      *.tar) tar -C "$tmp" -xf "$tarball";;
+      *) err "Formato binário não suportado: $tarball"; exit 1;;
+    esac
+
+    _install_tree_into_root "$tmp"
+    rm -rf "$tmp"
+
+    mkdir -p "$SPELL_DB/$name"
+    printf "%s\n" "$ver" > "$SPELL_DB/$name/version"
+    printf "%s\n" "$rel" > "$SPELL_DB/$name/release"
+
+    # gerar lista de arquivos instalados a partir do tar
+    case "$tarball" in
+      *.tar.zst|*.tar.zstd)
+        if tar_supports_zstd; then
+          tar -tf "$tarball" | sed 's#^#/#' > "$SPELL_DB/$name/files"
+        else
+          zstd -d -c "$tarball" | tar -tf - | sed 's#^#/#' > "$SPELL_DB/$name/files"
+        fi ;;
+      *) tar -tf "$tarball" | sed 's#^#/#' > "$SPELL_DB/$name/files" ;;
+    esac
+
+    date -u +%FT%TZ > "$SPELL_DB/$name/installed_at"
+    run_hook post-install "$name" || true
+  } &>"$log"
+  stop_spinner
+  ok "Instalado: $name-$ver (release $rel)"
+}
+
+install_from_source() {
+  local name="$1"; local bin; bin=$(make_binary "$name"); install_binary "$bin"
 }
 
 ########################################
@@ -306,10 +355,15 @@ remove_package() {
   [[ -d "$SPELL_DB/$name" ]] || { warn "$name não está instalado"; return 0; }
   run_hook pre-remove "$name" || true
   info "Removendo $name"
+  # remover em ordem reversa; tentar limpar diretórios ascendentes
   tac "$SPELL_DB/$name/files" | while read -r f; do
-    [[ -e "$f" || -L "$f" ]] && rm -f "$f" || true
+    [[ -z "$f" ]] && continue
+    if [[ -e "$f" || -L "$f" ]]; then
+      rm -f "$f" 2>/dev/null || true
+    fi
     # tentar remover diretórios vazios ascendentes
-    d=$(dirname "$f"); for _ in {1..6}; do rmdir "$d" 2>/dev/null || true; d=$(dirname "$d"); done
+    local d; d=$(dirname "$f")
+    for _ in {1..6}; do rmdir "$d" 2>/dev/null || true; d=$(dirname "$d"); done
   done
   rm -rf "$SPELL_DB/$name"
   run_hook post-remove "$name" || true
@@ -338,7 +392,7 @@ git_sync() {
 }
 
 ########################################
-# Upgrade (para novas versões / maior)
+# Upgrade
 ########################################
 
 upgrade_one() {
@@ -352,10 +406,11 @@ upgrade_one() {
 }
 
 ########################################
-# Busca e info
+# Busca / info / list
 ########################################
 
-cmd_search() { local q="$1"; ls -1 "$SPELL_FORMULAE"/*.spell 2>/dev/null | sed 's#.*/##;s/\.spell$//' | grep -i -- "$q" || true; }
+cmd_search() { local q="${1:-}"; ls -1 "$SPELL_FORMULAE"/*.spell 2>/dev/null | sed 's#.*/##;s/\.spell$//' | grep -i -- "$q" || true; }
+
 cmd_info() {
   local name="$1"; load_formula "$name"
   echo "NAME: $NAME"
@@ -369,6 +424,18 @@ cmd_info() {
   else
     echo "INSTALLED: no"
   fi
+}
+
+cmd_list() {
+  [[ -d "$SPELL_DB" ]] || return 0
+  for d in "$SPELL_DB"/*; do
+    [[ -d "$d" ]] || continue
+    local n v r
+    n=$(basename "$d")
+    v=$(<"$d/version")
+    r=$(<"$d/release" 2>/dev/null || echo 1)
+    echo "$n $v-$r"
+  done
 }
 
 ########################################
@@ -413,19 +480,20 @@ remove_with_reverse_deps() {
 scaffold() {
   local name="$1"; local path="$SPELL_FORMULAE/$name.spell"
   [[ -e "$path" ]] && { err "Já existe: $path"; exit 1; }
+  mkdir -p "$(dirname "$path")"
   cat > "$path" <<'EOF'
 # Exemplo de fórmula spell (edite os campos)
 NAME="hello"
-VERSION="2.12"
+VERSION="2.12.1"
 RELEASE=1
-URL="https://ftp.gnu.org/gnu/hello/hello-2.12.tar.xz"
-SHA256="6e82b9b9a2a3c31c52a4da41d652262e7490efa4693e6a0eef8949cc0f9b9428"
+URL="https://ftp.gnu.org/gnu/hello/hello-2.12.1.tar.xz"
+SHA256="b7e4469d5f0f0c3ad0a2a51421e0b2d0f1a54f2b0a35b1f2aa4a5e1c6f1b8c9d"
 DEPENDS=( )
 # PATCHES=( patches/ )
 
 BUILD() {
   ./configure --prefix=/usr
-  make -j"$(nproc || echo 1)"
+  make -j"$(nproc 2>/dev/null || echo 1)"
 }
 
 INSTALL() {
@@ -451,13 +519,13 @@ Comandos principais:
   unpack <pkg>                  Descompacta para workdir
   patch <pkg>                   Aplica patches
   build <pkg>                   Compila e prepara DESTDIR
-  bin   <pkg>                   Gera pacote binário (tar.zst)
+  bin   <pkg>                   Gera pacote binário (.tar.zst)
   install <pkg>                 Compila e instala (com DESTDIR/fakeroot)
   install-order <pkgs...>       Instala com resolução topológica (deps primeiro)
   remove <pkg>                  Remove pacote instalado
-  remove-order <pkgs...>        Remove em ordem reversa
+  remove-order <pkgs...>        Remove em ordem reversa de dependências
   search <texto>                Procura por fórmulas
-  info <pkg>                    Informações do pacote
+  info <pkg>                    Informações da fórmula + status
   list                          Lista instalados
   upgrade <pkg|--all>           Atualiza para a versão da fórmula
   sync                          Sincroniza estado para repo git
@@ -471,30 +539,29 @@ Diretórios:
 EOF
 }
 
-cmd_list() { ls -1 "$SPELL_DB" 2>/dev/null || true; }
-
 main() {
   local cmd="${1:-}"; shift || true
   case "${cmd}" in
     init) ok "Spell inicializado em $SPELL_HOME";;
-    create) scaffold "$@";;
-    fetch) fetch_source "$@";;
-    unpack) unpack_to_workdir "$@";;
-    patch) apply_patches "$@";;
-    build) build_package "$@" >/dev/null;;
-    bin) make_binary "$@";;
-    install) install_from_source "$@";;
+    create) scaffold "${1:?informe o nome}";;
+    fetch) fetch_source "${1:?pkg}";;
+    unpack) unpack_to_workdir "${1:?pkg}";;
+    patch) apply_patches "${1:?pkg}";;
+    build) build_package "${1:?pkg}" >/dev/null;;
+    bin) make_binary "${1:?pkg}";;
+    install) install_from_source "${1:?pkg}";;
     install-order) install_with_deps "$@";;
-    remove) remove_package "$@";;
+    remove) remove_package "${1:?pkg}";;
     remove-order) remove_with_reverse_deps "$@";;
     search) cmd_search "${1:-}";;
-    info) cmd_info "$@";;
+    info) cmd_info "${1:?pkg}";;
     list) cmd_list;;
     upgrade)
       if [[ "${1:-}" == "--all" ]]; then
-        for f in "$SPELL_FORMULAE"/*.spell; do [[ -e "$f" ]] || continue; n=$(basename "$f" .spell); upgrade_one "$n"; done
+        shopt -s nullglob
+        for f in "$SPELL_FORMULAE"/*.spell; do n=$(basename "$f" .spell); upgrade_one "$n"; done
       else
-        upgrade_one "$@"
+        upgrade_one "${1:?pkg}"
       fi
       ;;
     sync) git_sync ;;
