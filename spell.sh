@@ -1,582 +1,507 @@
 #!/usr/bin/env bash
-# spell — gerenciador de programas source-based para LFS
-# Autor: você + ChatGPT (GPT-5 Thinking)
+# spell — um gerenciador de programas simples para LFS
 # Licença: MIT
-#
-# Objetivos (resumo):
-# - Tudo dirigível por variáveis e receitas YAML simples
-# - Baixa com curl/git, descompacta (tar.{gz,bz2,xz,zst}, zip)
-# - Patch por diretório local ou URL(s)
-# - Build com DESTDIR/fakeroot; empacota (tar) antes de instalar
-# - Registro + logs
-# - Instalação, remoção (uninstall) e reversão
-# - Resolução de dependências por ordenação topológica (tsort)
-# - "build" faz tudo menos instalar; "upgrade"; "search"; "fix"/"revdev"; limpeza; órfãos
-# - Saída colorida + spinner
-#
-# Requisitos base: bash, coreutils, curl, git, tar, patch, find, awk, sed, tsort.
-# O fakeroot é opcional (se existir será usado).
+# Requisitos: bash 4+, coreutils, curl, git, tar, xz, unzip, gzip, bzip2, zstd, patch, sha256sum,
+#              rsync, fakeroot (opcional mas recomendado), jq (opcional para saída bonita)
+# Testado: Linux base, sem systemd dependente. Use por sua conta e risco.
 
 set -euo pipefail
 IFS=$'\n\t'
 
-################################################################################
-# Configuração (variáveis expansíveis)
-################################################################################
-: "${SPELL_ROOT:=/var/lib/spell}"             # estado e banco local
-: "${SPELL_RECIPES_DIR:=${SPELL_ROOT}/recipes}" # onde ficam as receitas YAML
-: "${SPELL_BUILD_ROOT:=${SPELL_ROOT}/build}"    # diretórios de trabalho por pacote
-: "${SPELL_SRC_CACHE:=${SPELL_ROOT}/src}"       # cache de downloads
-: "${SPELL_PKG_DIR:=${SPELL_ROOT}/pkgs}"        # pacotes binários gerados (tar)
-: "${SPELL_LOG_DIR:=${SPELL_ROOT}/logs}"        # logs de build/instalação
-: "${SPELL_DB_DIR:=${SPELL_ROOT}/db}"           # registros por pacote instalado
-: "${SPELL_GIT_REPO:=}"                         # opcional: repo git para sync (receitas/estado)
-: "${SPELL_SUDO:=}"                             # ex.: SPELL_SUDO=sudo se precisar
-: "${SPELL_PREFIX:=/usr}"                       # prefixo padrão
-: "${SPELL_JOBS:=$(nproc 2>/dev/null || echo 1)}" # paralelismo sugerido
-: "${SPELL_COLOR:=auto}"                        # auto|always|never
-: "${SPELL_SPINNER:=1}"                         # 1=liga, 0=desliga
-: "${DESTDIR_BASE:=/tmp/spell-destdir}"         # raiz DESTDIRs
+VERSION="0.1.0"
 
-# Carregar rc local (opcional)
-[ -f /etc/spellrc ] && . /etc/spellrc || true
-[ -f "$HOME/.spellrc" ] && . "$HOME/.spellrc" || true
+########################################
+# Configuração
+########################################
+: "${SPELL_HOME:=${XDG_DATA_HOME:-$HOME/.local/share}/spell}"     # estado e cache
+: "${SPELL_ETC:=${XDG_CONFIG_HOME:-$HOME/.config}/spell}"         # config & fórmulas
+: "${SPELL_REPO:=$SPELL_HOME/repo}"                               # repositório git (estado)
+: "${SPELL_FORMULAE:=$SPELL_ETC/formulae}"                        # diretório de pacotes *.spell
+: "${SPELL_WORK:=$SPELL_HOME/work}"                               # diretório de trabalho (build/DESTDIR)
+: "${SPELL_SRC:=$SPELL_HOME/src}"                                 # downloads originais
+: "${SPELL_BINREPO:=$SPELL_HOME/binrepo}"                         # pacotes binários construídos (tar)
+: "${SPELL_LOGS:=$SPELL_HOME/logs}"                               # logs de build/install
+: "${SPELL_DB:=$SPELL_HOME/db}"                                   # base instalada
+: "${SPELL_HOOKS:=$SPELL_ETC/hooks}"                              # hooks (pre-install, post-remove, etc)
+: "${SPELL_COLOR:=1}"
+: "${SPELL_SPINNER:=1}"
 
-mkdir -p "$SPELL_RECIPES_DIR" "$SPELL_BUILD_ROOT" "$SPELL_SRC_CACHE" \
-  "$SPELL_PKG_DIR" "$SPELL_LOG_DIR" "$SPELL_DB_DIR"
+mkdir -p "$SPELL_HOME" "$SPELL_ETC" "$SPELL_REPO" "$SPELL_FORMULAE" \
+         "$SPELL_WORK" "$SPELL_SRC" "$SPELL_BINREPO" "$SPELL_LOGS" "$SPELL_DB" "$SPELL_HOOKS"
 
-################################################################################
-# Colorização e UI
-################################################################################
-_supports_color() {
-  case "$SPELL_COLOR" in
-    always) return 0;;
-    never) return 1;;
-    auto) [ -t 1 ] && return 0 || return 1;;
-  esac
-}
-
-if _supports_color; then
-  c_reset='\033[0m'; c_dim='\033[2m'; c_bold='\033[1m'
-  c_red='\033[31m'; c_green='\033[32m'; c_yellow='\033[33m'; c_blue='\033[34m'
+########################################
+# Utilidades: cores, spinner, log
+########################################
+if [[ ${SPELL_COLOR} -eq 1 && -t 1 ]]; then
+  C_RESET='\033[0m'; C_BOLD='\033[1m'; C_DIM='\033[2m'
+  C_RED='\033[31m'; C_GREEN='\033[32m'; C_YELLOW='\033[33m'; C_BLUE='\033[34m'
 else
-  c_reset=''; c_dim=''; c_bold=''; c_red=''; c_green=''; c_yellow=''; c_blue=''
+  C_RESET=''; C_BOLD=''; C_DIM=''; C_RED=''; C_GREEN=''; C_YELLOW=''; C_BLUE=''
 fi
 
-log()  { printf "%b[spell]%b %s\n" "$c_dim" "$c_reset" "$*"; }
-info() { printf "%b[✓]%b %s\n" "$c_green" "$c_reset" "$*"; }
-warn() { printf "%b[!]%b %s\n" "$c_yellow" "$c_reset" "$*"; }
-err()  { printf "%b[✗]%b %s\n" "$c_red" "$c_reset" "$*" >&2; }
+msg() { printf "%b\n" "${C_BOLD}$*${C_RESET}"; }
+info() { printf "%b\n" "${C_BLUE}==>${C_RESET} $*"; }
+ok()   { printf "%b\n" "${C_GREEN}✔${C_RESET} $*"; }
+warn() { printf "%b\n" "${C_YELLOW}⚠${C_RESET} $*"; }
+err()  { printf "%b\n" "${C_RED}✖${C_RESET} $*" 1>&2; }
 
-_spinner() {
-  [ "${SPELL_SPINNER}" = 1 ] || { "$@"; return $?; }
-  ( "$@" ) &
-  pid=$!
-  spin='|/-\\'
-  i=0
-  while kill -0 $pid 2>/dev/null; do
-    i=$(( (i+1) % 4 ))
-    printf "\r%b[%s]%b %s" "$c_blue" "${spin:$i:1}" "$c_reset" "$*"
-    sleep 0.1
-  done
-  wait $pid; rc=$?
-  printf "\r%*s\r" $(( ${#*} + 8 )) "" # limpa linha
-  return $rc
+SP_PID=""
+start_spinner() {
+  [[ ${SPELL_SPINNER} -eq 1 && -t 1 ]] || return 0
+  local chars='⠋⠙⠚⠞⠖⠦⠴⠲⠳⠓'
+  ( while :; do for ((i=0;i<${#chars};i++)); do printf "\r%s" "${chars:i:1}"; sleep 0.08; done; done ) &
+  SP_PID=$!
+}
+stop_spinner() { [[ -n ${SP_PID} ]] && { kill "$SP_PID" >/dev/null 2>&1 || true; printf "\r \\r"; SP_PID=""; }; }
+
+logfile() { mkdir -p "$SPELL_LOGS/$1"; printf "%s/%s/%s.log" "$SPELL_LOGS" "$1" "$(date +%Y%m%d-%H%M%S)"; }
+
+########################################
+# Formato de fórmula (*.spell)
+# Arquivo bash que define:
+#   NAME, VERSION, RELEASE (opcional), URL (tarball) OU GIT (url,branch,commit)
+#   SHA256 (tarball), DEPENDS=(...) opcional
+#   PATCHES=( local/dir/*.patch | http(s):// | git:// ) opcional
+#   BUILD() { ./configure --prefix=/usr; make; }  (obrigatório)
+#   INSTALL() { make DESTDIR="$DESTDIR" install; } (opcional; padrão roda "make DESTDIR install")
+#   STRIP_BINARIES=1 (padrão 1)
+########################################
+
+load_formula() {
+  local name="$1"; local path="$SPELL_FORMULAE/$name.spell"
+  [[ -f "$path" ]] || { err "Fórmula não encontrada: $name ($path)"; exit 1; }
+  # shellcheck disable=SC1090
+  source "$path"
+  : "${NAME:?defina NAME}"; : "${VERSION:?defina VERSION}"
+  : "${RELEASE:=1}"; : "${DEPENDS:=()}"; : "${STRIP_BINARIES:=1}"
 }
 
-################################################################################
-# Utilidades
-################################################################################
-need() { command -v "$1" >/dev/null 2>&1 || { err "Requer: $1"; exit 1; }; }
-NEEDED=(bash curl git tar patch awk sed tsort)
-for n in "${NEEDED[@]}"; do need "$n"; done
-
-_has() { command -v "$1" >/dev/null 2>&1; }
-_use_fakeroot() { _has fakeroot && echo fakeroot || true; }
-_ts() { date +"%Y-%m-%d_%H-%M-%S"; }
-
-# Segurança mínima de path
-umask 022
-
-################################################################################
-# Mini-parser YAML (chaves de 1º nível e listas simples; blocks com "|" suportados)
-################################################################################
-# Limitações: YAML simples (UTF-8). Para receitas avançadas, use apenas:
-#  key: value
-#  key: |
-#    linhas...
-#  key:
-#    - item1
-#    - item2
-#  key:
-#    subkey: value   (apenas um nível extra para 'source')
-#  source:
-#    type: url|git
-#    url:  ... (ou repo: ...; ref: ...)
-#
-# As funções abaixo extraem valores de topo e blocos.
-
-_yaml_val() { # _yaml_val KEY FILE
-  awk -v k="^"$1"\\s*:" '
-    $0 ~ k {
-      sub(/^[^:]+:\s*/, ""); print; exit
+formula_field() { # imprime um campo da fórmula sem carregar tudo
+  local name="$1" field="$2"; local path="$SPELL_FORMULAE/$name.spell"
+  [[ -f "$path" ]] || return 1
+  # usar grep sed simples (não executa)
+  awk -v f="$field" 'BEGIN{IGNORECASE=0}
+    $1==f {
+      sub(/^.*=\(/, ""); sub(/\).*/, ""); print; exit
     }
-  ' "$2" | sed 's/^"\|"$//g'
+    match($0, "^"f"=\"[^\"]*\"") { s=$0; sub(/^"f"=\"/, "", s); sub(/\"$/, "", s); print s; exit }
+  ' "$path"
 }
 
-_yaml_block() { # _yaml_block KEY FILE -> imprime bloco (|) sem indentação inicial
-  awk -v k="^"$1"\\s*:\s*\|" '
-    $0 ~ k { in=1; next }
-    in {
-      if ($0 ~ /^[^[:space:]-][^:]*:\s*/) { in=0; exit } # próxima chave topo
-      sub(/^  /, ""); print
-    }
-  ' "$2"
+########################################
+# Resolução de dependências (topo + reverse)
+########################################
+
+# topo_order <alvos...> -> escreve ordem com dependências primeiro
+
+topo_order() {
+  declare -A seen; declare -a order
+  local visit
+  visit() {
+    local pkg="$1"; [[ -n ${seen[$pkg]:-} ]] && return 0; seen[$pkg]=visiting
+    load_formula "$pkg" >/dev/null 2>&1 || { err "Fórmula $pkg ausente"; exit 1; }
+    local d
+    for d in "${DEPENDS[@]:-}"; do visit "$d"; done
+    seen[$pkg]=done; order+=("$pkg")
+  }
+  local t
+  for t in "$@"; do visit "$t"; done
+  printf "%s\n" "${order[@]}"
 }
 
-_yaml_list() { # _yaml_list KEY FILE -> itens "- ..."
-  awk -v k="^"$1"\\s*:\s*$" '
-    $0 ~ k { in=1; next }
-    in {
-      if ($0 ~ /^[^[:space:]-][^:]*:\s*/) { in=0; exit }
-      if ($0 ~ /^\s*-\s*/) { sub(/^\s*-\s*/,""); print }
-    }
-  ' "$2"
-}
+# reverse_topo_order: dependentes primeiro (útil para remoção)
+reverse_topo_order() { mapfile -t _o < <(topo_order "$@"); tac <<<"${_o[*]}" | tr ' ' '\n'; }
 
-_yaml_mapval() { # _yaml_mapval PARENTKEY CHILDKEY FILE
-  awk -v p="^"$1"\\s*:\s*$" -v c="^\s*"$2"\\s*:\" '
-    $0 ~ p { in=1; next }
-    in {
-      if ($0 ~ /^[^[:space:]-][^:]*:\s*/) { in=0; exit }
-      if ($0 ~ c) { sub(/^\s*[^:]+:\s*/, ""); print; exit }
-    }
-  ' "$3" | sed 's/^"\|"$//g'
-}
+########################################
+# Download / verificação
+########################################
 
-################################################################################
-# Receita: leitura
-################################################################################
-load_recipe() { # NAME -> exporta variáveis RECIPE_*
-  local name="$1" file="$SPELL_RECIPES_DIR/$1.yaml"
-  [ -f "$file" ] || { err "Receita não encontrada: $name"; exit 1; }
-
-  RECIPE_NAME=$( _yaml_val name "$file" ); export RECIPE_NAME
-  RECIPE_VERSION=$( _yaml_val version "$file" ); export RECIPE_VERSION
-  RECIPE_DESC=$( _yaml_val description "$file" ); export RECIPE_DESC
-  RECIPE_HOMEPAGE=$( _yaml_val homepage "$file" ); export RECIPE_HOMEPAGE
-  RECIPE_LICENSE=$( _yaml_val license "$file" ); export RECIPE_LICENSE
-  RECIPE_DEPENDS=( $( _yaml_list depends "$file" ) ); export RECIPE_DEPENDS
-
-  SRC_TYPE=$( _yaml_mapval source type "$file" ); export SRC_TYPE
-  SRC_URL=$( _yaml_mapval source url "$file" ); export SRC_URL
-  SRC_REPO=$( _yaml_mapval source repo "$file" ); export SRC_REPO
-  SRC_REF=$( _yaml_mapval source ref "$file" ); export SRC_REF
-
-  PATCHES=( $( _yaml_list patches "$file" ) ); export PATCHES
-
-  RECIPE_BUILD=$( _yaml_block build "$file" ); export RECIPE_BUILD
-  RECIPE_INSTALL=$( _yaml_block install "$file" ); export RECIPE_INSTALL
-
-  # Defaults
-  : "${RECIPE_NAME:=$name}"
-  : "${RECIPE_VERSION:=0}"
-  : "${SRC_TYPE:=url}"
-  : "${RECIPE_INSTALL:=$'make DESTDIR="$DESTDIR" install'}"
-  : "${RECIPE_BUILD:=$'./configure --prefix="$SPELL_PREFIX"\nmake -j"$SPELL_JOBS}"
-
-  export SRC_TYPE SRC_URL SRC_REPO SRC_REF
-}
-
-################################################################################
-# Download & unpack
-################################################################################
-fetch_source() { # NAME -> retorna SRCDIR
-  local name="$1"; load_recipe "$name"
-  local builddir="$SPELL_BUILD_ROOT/$RECIPE_NAME-$RECIPE_VERSION"
-  rm -rf "$builddir"; mkdir -p "$builddir"
-
-  case "$SRC_TYPE" in
-    url)
-      [ -n "$SRC_URL" ] || { err "source.url ausente"; exit 1; }
-      local fname="$SPELL_SRC_CACHE/$(basename "$SRC_URL")"
-      if [ ! -f "$fname" ]; then
-        _spinner curl -L --fail -o "$fname" "$SRC_URL"
-        info "Baixado: $fname"
-      fi
-      unpack "$fname" "$builddir"
-      ;;
-    git)
-      [ -n "$SRC_REPO" ] || { err "source.repo ausente"; exit 1; }
-      _spinner git clone --depth 1 ${SRC_REF:+--branch "$SRC_REF"} "$SRC_REPO" "$builddir/src"
-      ;;
-    *) err "source.type desconhecido: $SRC_TYPE"; exit 1;;
-  esac
-  echo "$builddir"
-}
-
-unpack() { # ARCHIVE DESTDIR
-  local a="$1" d="$2"
-  mkdir -p "$d/src"
-  case "$a" in
-    *.tar.gz|*.tgz)     tar -xzf "$a" -C "$d/src" ;;
-    *.tar.bz2|*.tbz2)   tar -xjf "$a" -C "$d/src" ;;
-    *.tar.xz|*.txz)     tar -xJf "$a" -C "$d/src" ;;
-    *.tar.zst|*.tzst)   tar --zstd -xf "$a" -C "$d/src" ;;
-    *.zip)              unzip -q "$a" -d "$d/src" ;;
-    *.tar)              tar -xf "$a" -C "$d/src" ;;
-    *) err "Formato de arquivo não suportado: $a"; exit 1;;
-  esac
-  # Se criou diretório único, entrar nele
-  local first
-  first=$(find "$d/src" -mindepth 1 -maxdepth 1 -type d | head -n1 || true)
-  [ -n "$first" ] && mv "$first" "$d/srcdir" || mv "$d/src" "$d/srcdir"
-}
-
-################################################################################
-# Patches
-################################################################################
-apply_patches() {
-  local builddir="$1"
-  [ ${#PATCHES[@]} -eq 0 ] && return 0 || true
-  pushd "$builddir/srcdir" >/dev/null
-  for p in "${PATCHES[@]}"; do
-    if [ -d "$p" ]; then
-      find "$p" -type f -name '*.patch' -o -name '*.diff' | sort | while read -r f; do
-        info "patch < $f"
-        patch -p1 <"$f"
-      done
+fetch_source() {
+  local name="$1"; load_formula "$name"
+  mkdir -p "$SPELL_SRC/$NAME-$VERSION"
+  if [[ -n ${URL:-} ]]; then
+    local fname="$SPELL_SRC/$NAME-$VERSION/$(basename "$URL")"
+    if [[ ! -f "$fname" ]]; then
+      info "Baixando $URL"
+      curl -L --fail -o "$fname" "$URL"
     else
-      # URL ou arquivo
-      if [[ "$p" =~ ^https?:// ]]; then
-        tmp="$SPELL_SRC_CACHE/patch-$(basename "$p")"
-        curl -L --fail -o "$tmp" "$p"
-        patch -p1 <"$tmp"
-      else
-        patch -p1 <"$p"
-      fi
+      info "Usando cache: $fname"
+    fi
+    if [[ -n ${SHA256:-} ]]; then
+      (cd "$(dirname "$fname")" && echo "$SHA256  $(basename "$fname")" | sha256sum -c -) || { err "sha256 inválido"; exit 1; }
+    fi
+    echo "$fname"
+  elif [[ -n ${GIT:-} ]]; then
+    local dest="$SPELL_SRC/$NAME-$VERSION/git"
+    if [[ ! -d "$dest/.git" ]]; then
+      info "Clonando $GIT"
+      git clone --depth=1 ${GIT_BRANCH:+-b "$GIT_BRANCH"} "$GIT" "$dest"
+    else
+      info "Atualizando git: $dest"
+      (cd "$dest" && git fetch --all --tags && git reset --hard ${GIT_COMMIT:-origin/${GIT_BRANCH:-HEAD}})
+    fi
+    echo "$dest"
+  else
+    err "Defina URL ou GIT em $name"; exit 1
+  fi
+}
+
+########################################
+# Descompactação para diretório de trabalho
+########################################
+
+unpack_to_workdir() {
+  local name="$1"; load_formula "$name"
+  local src; src=$(fetch_source "$name")
+  local wdir="$SPELL_WORK/$NAME-$VERSION"
+  rm -rf "$wdir"; mkdir -p "$wdir"
+  info "Descompactando em $wdir"
+  if [[ -d "$src/.git" ]]; then
+    rsync -a --delete "$src/" "$wdir/"
+  else
+    case "$src" in
+      *.tar.gz|*.tgz)   tar -C "$wdir" --strip-components=1 -xzf "$src";;
+      *.tar.bz2|*.tbz2) tar -C "$wdir" --strip-components=1 -xjf "$src";;
+      *.tar.xz)         tar -C "$wdir" --strip-components=1 -xJf "$src";;
+      *.tar.zst|*.tar.zstd) tar -C "$wdir" --strip-components=1 --zstd -xf "$src";;
+      *.zip)            unzip -q "$src" -d "$wdir" && _first=$(find "$wdir" -mindepth 1 -maxdepth 1 -type d | head -n1) && [[ -n $_first ]] && rsync -a "$wdir/""$_first"/ "$wdir/" && rm -rf "$wdir"/"$_first";;
+      *.tar)            tar -C "$wdir" --strip-components=1 -xf "$src";;
+      *) err "Formato não suportado: $src"; exit 1;;
+    esac
+  fi
+  echo "$wdir"
+}
+
+########################################
+# Patches (dir, http(s), git)
+########################################
+apply_patches() {
+  local name="$1"; load_formula "$name"
+  [[ -z ${PATCHES:+x} ]] && return 0
+  local wdir="$SPELL_WORK/$NAME-$VERSION"; [[ -d "$wdir" ]] || wdir=$(unpack_to_workdir "$name")
+  info "Aplicando patches"
+  pushd "$wdir" >/dev/null
+  local p
+  for p in "${PATCHES[@]}"; do
+    if [[ -d "$p" ]]; then
+      for f in "$p"/*.patch; do [[ -e "$f" ]] || continue; info "patch < $(basename "$f")"; patch -p1 < "$f"; done
+    elif [[ "$p" =~ ^https?:// ]]; then
+      tmp=$(mktemp); curl -L --fail -o "$tmp" "$p"; info "patch < $(basename "$p")"; patch -p1 < "$tmp"; rm -f "$tmp"
+    elif [[ "$p" =~ ^git://|^https?://.*\.git$ ]]; then
+      tmpdir=$(mktemp -d); git clone --depth=1 "$p" "$tmpdir"; for f in "$tmpdir"/*.patch; do [[ -e "$f" ]] || continue; info "patch < $(basename "$f")"; patch -p1 < "$f"; done; rm -rf "$tmpdir"
+    elif [[ -f "$p" ]]; then
+      info "patch < $(basename "$p")"; patch -p1 < "$p"
+    else
+      warn "Ignorando origem de patch desconhecida: $p"
     fi
   done
   popd >/dev/null
 }
 
-################################################################################
-# Build & Install & Package
-################################################################################
-run_build() {
-  local name="$1"; load_recipe "$name"
-  local builddir=$(fetch_source "$name")
-  apply_patches "$builddir"
+########################################
+# Build, pacote binário e instalação com DESTDIR/fakeroot
+########################################
 
-  local logf="$SPELL_LOG_DIR/${RECIPE_NAME}-build-$(_ts).log"
-  pushd "$builddir/srcdir" >/dev/null
-  info "Build: $RECIPE_NAME-$RECIPE_VERSION"
-  printf "%s\n" "$RECIPE_BUILD" > "$builddir/BUILD.sh"
-  chmod +x "$builddir/BUILD.sh"
-  ( set -o pipefail; _spinner bash -e "$builddir/BUILD.sh" 2>&1 | tee "$logf" >/dev/null )
-  popd >/dev/null
-  echo "$builddir"
-}
-
-package_stage() {
-  local name="$1"; load_recipe "$name"
-  local builddir="$2"
-  local dest="${DESTDIR_BASE}/${RECIPE_NAME}-${RECIPE_VERSION}"
-  rm -rf "$dest"; mkdir -p "$dest"
-
-  local logf="$SPELL_LOG_DIR/${RECIPE_NAME}-install-$(_ts).log"
-  pushd "$builddir/srcdir" >/dev/null
-  local installer="$builddir/INSTALL.sh"
-  printf "%s\n" "$RECIPE_INSTALL" > "$installer"; chmod +x "$installer"
-  info "Instala (DESTDIR staging): $RECIPE_NAME"
-  ( set -o pipefail; DESTDIR="$dest" _spinner bash -e "$installer" 2>&1 | tee -a "$logf" >/dev/null )
-  popd >/dev/null
-
-  # Criar pacote binário tar
-  local pkg="$SPELL_PKG_DIR/${RECIPE_NAME}-${RECIPE_VERSION}.tar.zst"
-  ( cd "$dest" && tar --zstd -cf "$pkg" . )
-  info "Pacote criado: $pkg"
-  echo "$pkg|$dest"
-}
-
-install_pkg() {
-  local name="$1"; load_recipe "$name"
-  local pkg_staging="$2"; local pkg="${pkg_staging%%|*}"; local stage="${pkg_staging##*|}"
-
-  local use_fk=$(_use_fakeroot)
-  info "Instalando no sistema (${use_fk:+com fakeroot})"
-  if [ -n "$use_fk" ]; then
-    $use_fk sh -c "cd '$stage' && cp -a . /"
-  else
-    ${SPELL_SUDO:-} sh -c "cd '$stage' && cp -a . /"
-  fi
-
-  # Manifesto de arquivos
-  local manifest="$SPELL_DB_DIR/${RECIPE_NAME}.manifest"
-  ( cd "$stage" && find . -type f -o -type l -o -type d | sed 's#^\.##' | sort ) > "$manifest"
-
-  # Registro de metadados
-  local meta="$SPELL_DB_DIR/${RECIPE_NAME}.meta"
+build_package() {
+  local name="$1"; load_formula "$name"
+  local wdir; wdir=$(unpack_to_workdir "$name")
+  apply_patches "$name"
+  local log; log=$(logfile "$NAME")
+  local DESTDIR="$wdir/_destdir"; export DESTDIR
+  rm -rf "$DESTDIR"; mkdir -p "$DESTDIR"
+  pushd "$wdir" >/dev/null
+  info "Compilando $NAME-$VERSION (log: $log)"
+  start_spinner
   {
-    echo "name: $RECIPE_NAME"
-    echo "version: $RECIPE_VERSION"
-    echo "installed_at: $(_ts)"
-    echo "depends: ${RECIPE_DEPENDS[*]:-}"
-    echo "explicit: yes"
-  } > "$meta"
-  info "Registrado: $RECIPE_NAME $RECIPE_VERSION"
-}
-
-uninstall_pkg() {
-  local name="$1"
-  local manifest="$SPELL_DB_DIR/${name}.manifest"
-  [ -f "$manifest" ] || { warn "Não instalado: $name"; return 0; }
-  tac "$manifest" | while read -r path; do
-    [ -z "$path" ] && continue
-    ${SPELL_SUDO:-} rm -f -- "$path" 2>/dev/null || true
-    # limpar diretórios vazios
-    d="$(dirname "$path")"
-    while [ "$d" != "/" ]; do
-      rmdir "$d" 2>/dev/null || break
-      d="$(dirname "$d")"
-    done
-  done
-  rm -f "$manifest" "$SPELL_DB_DIR/${name}.meta"
-  info "Removido: $name"
-}
-
-################################################################################
-# Dependências — grafo e ordenação topológica
-################################################################################
-_depends_of() { # nome -> lista dependências
-  local f="$SPELL_RECIPES_DIR/$1.yaml"; [ -f "$f" ] || return 0
-  _yaml_list depends "$f"
-}
-
-_build_graph() { # nomes... -> arestas "dep nome"
-  for n in "$@"; do
-    for d in $(_depends_of "$n"); do
-      echo "$d $n"
-    done
-  done
-}
-
-_toposort() { # lê arestas em stdin -> ordem topo (tsort)
-  tsort || true
-}
-
-_order_install() { # nomes... -> ordem topo
-  local edges=$(_build_graph "$@")
-  if [ -n "$edges" ]; then
-    printf "%s\n" "$edges" | _toposort
-  else
-    printf "%s\n" "$@"
-  fi
-}
-
-_order_remove() { # nomes... -> ordem reversa segura (dependentes antes)
-  local edges=$(_build_graph "$@")
-  if [ -n "$edges" ]; then
-    { printf "%s\n" "$edges" | _toposort; printf "%s\n" "$@"; } | awk '!seen[$0]++' | tac
-  else
-    printf "%s\n" "$@"
-  fi
-}
-
-################################################################################
-# Órfãos e correções
-################################################################################
-mark_auto() { # marca pacote como instalado automaticamente
-  local n="$1"; local m="$SPELL_DB_DIR/${n}.meta"; [ -f "$m" ] || return 0
-  sed -i 's/^explicit: .*/explicit: no/' "$m" || echo 'explicit: no' >> "$m"
-}
-
-list_installed() { ls "$SPELL_DB_DIR"/*.meta 2>/dev/null | xargs -r -n1 basename | sed 's/\.meta$//' || true; }
-
-list_orphans() {
-  local installed deps all
-  installed=( $(list_installed) )
-  declare -A needed=()
-  for n in "${installed[@]}"; do
-    depstr=$(awk -F': ' '/^depends:/{print $2}' "$SPELL_DB_DIR/${n}.meta" || true)
-    for d in $depstr; do needed[$d]=1; done
-  done
-  for n in "${installed[@]}"; do
-    explicit=$(awk -F': ' '/^explicit:/{print $2}' "$SPELL_DB_DIR/${n}.meta" || echo yes)
-    if [ -z "${needed[$n]:-}" ] && [ "$explicit" != "yes" ]; then
-      echo "$n"
+    if declare -F BUILD >/dev/null; then
+      BUILD
+    else
+      ./configure --prefix=/usr
+      make -j"${MAKEFLAGS_JOBS:-$(nproc || echo 1)}"
     fi
-  done
-}
-
-fix_registry() { # "revdev evoluído" — reconstroi manifests faltantes a partir de pacote
-  for meta in "$SPELL_DB_DIR"/*.meta; do
-    [ -e "$meta" ] || continue
-    n=$(awk -F': ' '/^name:/{print $2}' "$meta")
-    v=$(awk -F': ' '/^version:/{print $2}' "$meta")
-    man="$SPELL_DB_DIR/${n}.manifest"
-    if [ ! -f "$man" ] && [ -f "$SPELL_PKG_DIR/${n}-${v}.tar.zst" ]; then
-      warn "Manifesto ausente de $n – tentando reconstruir a partir do pacote"
-      tmp="$(mktemp -d)"; tar --zstd -tf "$SPELL_PKG_DIR/${n}-${v}.tar.zst" | sed 's/^\./ /' >/dev/null 2>&1 || true
-      tar --zstd -tf "$SPELL_PKG_DIR/${n}-${v}.tar.zst" | sed 's#^#/#' | sort > "$man"
-      rm -rf "$tmp"
+    if declare -F INSTALL >/dev/null; then
+      INSTALL
+    else
+      make DESTDIR="$DESTDIR" install
     fi
-  done
-}
-
-################################################################################
-# Comandos
-################################################################################
-cmd_build() { # build sem instalar
-  local targets=("$@")
-  local order=$(_order_install "${targets[@]}")
-  for n in $order; do
-    info "[build] $n"
-    bdir=$(run_build "$n")
-    package_stage "$n" "$bdir" >/dev/null
-  done
-}
-
-cmd_install() { # build + package + install
-  local targets=("$@")
-  local order=$(_order_install "${targets[@]}")
-  for n in $order; do
-    info "[install] $n"
-    bdir=$(run_build "$n")
-    pkgstg=$(package_stage "$n" "$bdir")
-    install_pkg "$n" "$pkgstg"
-  done
-}
-
-cmd_remove() { # remove em ordem reversa segura
-  local order=$(_order_remove "$@")
-  for n in $order; do uninstall_pkg "$n"; done
-}
-
-cmd_search() {
-  local q="$1"
-  for f in "$SPELL_RECIPES_DIR"/*.yaml; do
-    [ -e "$f" ] || continue
-    name=$( _yaml_val name "$f" ); [ -n "$name" ] || name=$(basename "$f" .yaml)
-    desc=$( _yaml_val description "$f" )
-    if echo "$name $desc" | grep -iE "$q" >/dev/null; then
-      printf "%s - %s\n" "$name" "${desc:-sem descrição}"
+    if [[ ${STRIP_BINARIES} -eq 1 ]]; then
+      find "$DESTDIR" -type f -perm -111 -exec strip --strip-unneeded {} + 2>/dev/null || true
     fi
-  done
-}
-
-cmd_upgrade() {
-  local targets=("$@")
-  [ ${#targets[@]} -gt 0 ] || targets=( $(list_installed) )
-  for n in "${targets[@]}"; do
-    load_recipe "$n"
-    warn "Rebuild→install: $RECIPE_NAME $RECIPE_VERSION"
-    bdir=$(run_build "$n")
-    pkgstg=$(package_stage "$n" "$bdir")
-    install_pkg "$n" "$pkgstg"
-  done
-}
-
-cmd_clean() {
-  rm -rf "$SPELL_BUILD_ROOT"/* || true
-  find "$SPELL_SRC_CACHE" -type f -mtime +30 -delete 2>/dev/null || true
-  info "Limpeza concluída"
-}
-
-cmd_orphans() { list_orphans; }
-
-cmd_fix() { fix_registry; info "Banco verificado."; }
-
-cmd_sync() { # commit state/receitas no git
-  [ -n "$SPELL_GIT_REPO" ] || { warn "SPELL_GIT_REPO não configurado"; return 0; }
-  if [ ! -d "$SPELL_GIT_REPO/.git" ]; then
-    git init "$SPELL_GIT_REPO"
-  fi
-  rsync -a --delete "$SPELL_RECIPES_DIR"/ "$SPELL_GIT_REPO/recipes/"
-  rsync -a "$SPELL_DB_DIR"/ "$SPELL_GIT_REPO/db/"
-  pushd "$SPELL_GIT_REPO" >/dev/null
-  git add -A
-  git commit -m "spell sync $(date -Is)" || true
+  } &>"$log"
+  stop_spinner
+  ok "Build concluído: $NAME-$VERSION"
   popd >/dev/null
-  info "Sync git: $SPELL_GIT_REPO"
+  echo "$DESTDIR"
 }
 
-cmd_mark_auto() { for n in "$@"; do mark_auto "$n"; done; }
+make_binary() {
+  local name="$1"; load_formula "$name"
+  local DESTDIR; DESTDIR=$(build_package "$name")
+  local out="$SPELL_BINREPO/${NAME}-${VERSION}-${RELEASE}.tar.zst"
+  info "Gerando binário: $(basename "$out")"
+  (cd "$DESTDIR" && tar --zstd -cf "$out" .)
+  # manifest
+  tar -tf "$out" | sort > "$SPELL_BINREPO/${NAME}-${VERSION}-${RELEASE}.manifest"
+  ok "Binário criado em $out"
+  echo "$out"
+}
+
+install_binary() {
+  local tarball="$1"; local name ver rel
+  name=$(basename "$tarball" | sed -E 's/^([^/]+)-([^-]+)-([0-9]+)\.tar\.(zst|xz|gz)$/\1/')
+  ver=$(basename "$tarball" | sed -E 's/^([^/]+)-([^-]+)-([0-9]+)\.tar\.(zst|xz|gz)$/\2/')
+  rel=$(basename "$tarball" | sed -E 's/^([^/]+)-([^-]+)-([0-9]+)\.tar\.(zst|xz|gz)$/\3/')
+  local log; log=$(logfile "$name")
+  info "Instalando $name-$ver-$rel (log: $log)"
+  start_spinner
+  {
+    local tmp; tmp=$(mktemp -d)
+    case "$tarball" in
+      *.tar.zst|*.tar.zstd) tar -C "$tmp" --zstd -xf "$tarball";;
+      *.tar.xz) tar -C "$tmp" -xJf "$tarball";;
+      *.tar.gz|*.tgz) tar -C "$tmp" -xzf "$tarball";;
+      *.tar) tar -C "$tmp" -xf "$tarball";;
+      *) err "Formato binário não suportado: $tarball"; exit 1;;
+    esac
+    if command -v fakeroot >/dev/null; then
+      fakeroot rsync -aH --delete-after "$tmp"/ /
+    else
+      rsync -aH --delete-after "$tmp"/ /
+    fi
+    rm -rf "$tmp"
+    mkdir -p "$SPELL_DB/$name"
+    printf "%s\n" "$ver" > "$SPELL_DB/$name/version"
+    printf "%s\n" "$rel" > "$SPELL_DB/$name/release"
+    tar -tf "$tarball" | sed 's#^#/#' > "$SPELL_DB/$name/files"
+    date -u +%FT%TZ > "$SPELL_DB/$name/installed_at"
+  } &>"$log"
+  stop_spinner
+  ok "Instalado: $name-$ver ($rel)"
+  run_hook pre-install "$name" || true  # compat: disparado antes do registro final é difícil; chamamos aqui tb
+  run_hook post-install "$name" || true
+}
+
+install_from_source() {
+  local name="$1"; local bin; bin=$(make_binary "$name"); install_binary "$bin"
+}
+
+########################################
+# Hooks
+########################################
+run_hook() {
+  local stage="$1"; local name="$2"
+  local hook="$SPELL_HOOKS/$stage"
+  if [[ -x "$hook" ]]; then
+    info "Hook: $stage"
+    NAME="$name" SPELL_HOME="$SPELL_HOME" SPELL_DB="$SPELL_DB" "$hook" || warn "Hook $stage falhou"
+  fi
+}
+
+########################################
+# Remoção (desfazendo instalação)
+########################################
+
+remove_package() {
+  local name="$1"
+  [[ -d "$SPELL_DB/$name" ]] || { warn "$name não está instalado"; return 0; }
+  run_hook pre-remove "$name" || true
+  info "Removendo $name"
+  tac "$SPELL_DB/$name/files" | while read -r f; do
+    [[ -e "$f" || -L "$f" ]] && rm -f "$f" || true
+    # tentar remover diretórios vazios ascendentes
+    d=$(dirname "$f"); for _ in {1..6}; do rmdir "$d" 2>/dev/null || true; d=$(dirname "$d"); done
+  done
+  rm -rf "$SPELL_DB/$name"
+  run_hook post-remove "$name" || true
+  ok "Removido $name"
+}
+
+########################################
+# Sync do estado para repositório git
+########################################
+
+git_sync() {
+  ( cd "$SPELL_REPO"
+    git init -q
+    mkdir -p db logs manifests
+    rsync -a "$SPELL_DB/" db/ 2>/dev/null || true
+    rsync -a "$SPELL_LOGS/" logs/ 2>/dev/null || true
+    rsync -a "$SPELL_BINREPO/" manifests/ 2>/dev/null || true
+    git add -A
+    if ! git diff --cached --quiet; then
+      git commit -m "spell sync $(date -u +%F_%T)" >/dev/null || true
+      info "Commit criado em $SPELL_REPO"
+    else
+      info "Sem mudanças para commit"
+    fi
+  )
+}
+
+########################################
+# Upgrade (para novas versões / maior)
+########################################
+
+upgrade_one() {
+  local name="$1"; load_formula "$name"
+  local current=""; [[ -f "$SPELL_DB/$name/version" ]] && current=$(<"$SPELL_DB/$name/version") || true
+  if [[ "$current" == "$VERSION" ]]; then
+    info "$name já está na versão $VERSION"; return 0
+  fi
+  info "Atualizando $name: $current -> $VERSION"
+  install_from_source "$name"
+}
+
+########################################
+# Busca e info
+########################################
+
+cmd_search() { local q="$1"; ls -1 "$SPELL_FORMULAE"/*.spell 2>/dev/null | sed 's#.*/##;s/\.spell$//' | grep -i -- "$q" || true; }
+cmd_info() {
+  local name="$1"; load_formula "$name"
+  echo "NAME: $NAME"
+  echo "VERSION: $VERSION"
+  echo "RELEASE: ${RELEASE:-1}"
+  echo "DEPENDS: ${DEPENDS[*]:-}"
+  [[ -n ${URL:-} ]] && echo "URL: $URL"
+  [[ -n ${GIT:-} ]] && echo "GIT: $GIT ${GIT_BRANCH:+(branch $GIT_BRANCH)} ${GIT_COMMIT:+@ $GIT_COMMIT}"
+  if [[ -d "$SPELL_DB/$NAME" ]]; then
+    echo "INSTALLED: yes ($(<"$SPELL_DB/$NAME/version"))"
+  else
+    echo "INSTALLED: no"
+  fi
+}
+
+########################################
+# Limpeza
+########################################
+
+clean() {
+  local what="${1:-build}";
+  case "$what" in
+    build) rm -rf "$SPELL_WORK"/*; ok "Limpou builds";;
+    src)   rm -rf "$SPELL_SRC"/*; ok "Limpou downloads";;
+    bin)   rm -rf "$SPELL_BINREPO"/*; ok "Limpou binrepo";;
+    all)   rm -rf "$SPELL_WORK"/* "$SPELL_SRC"/* "$SPELL_BINREPO"/*; ok "Limpou tudo";;
+    *)     err "Opção inválida: $what"; exit 1;;
+  esac
+}
+
+########################################
+# Instalação respeitando dependências
+########################################
+
+install_with_deps() {
+  local targets=("$@")
+  mapfile -t order < <(topo_order "${targets[@]}")
+  info "Ordem de build: ${order[*]}"
+  local p
+  for p in "${order[@]}"; do install_from_source "$p"; done
+}
+
+remove_with_reverse_deps() {
+  local targets=("$@")
+  mapfile -t order < <(reverse_topo_order "${targets[@]}")
+  info "Ordem de remoção: ${order[*]}"
+  local p
+  for p in "${order[@]}"; do remove_package "$p"; done
+}
+
+########################################
+# Scaffold de fórmula
+########################################
+
+scaffold() {
+  local name="$1"; local path="$SPELL_FORMULAE/$name.spell"
+  [[ -e "$path" ]] && { err "Já existe: $path"; exit 1; }
+  cat > "$path" <<'EOF'
+# Exemplo de fórmula spell (edite os campos)
+NAME="hello"
+VERSION="2.12"
+RELEASE=1
+URL="https://ftp.gnu.org/gnu/hello/hello-2.12.tar.xz"
+SHA256="6e82b9b9a2a3c31c52a4da41d652262e7490efa4693e6a0eef8949cc0f9b9428"
+DEPENDS=( )
+# PATCHES=( patches/ )
+
+BUILD() {
+  ./configure --prefix=/usr
+  make -j"$(nproc || echo 1)"
+}
+
+INSTALL() {
+  make DESTDIR="$DESTDIR" install
+}
+EOF
+  ok "Fórmula criada: $path"
+}
+
+########################################
+# CLI
+########################################
 
 usage() {
   cat <<EOF
-${c_bold}spell${c_reset} — gerenciador de programas (source-based)
+spell ${VERSION}
+Uso: spell <comando> [args]
 
-Uso:
-  spell build <pacote...>       # compila e empacota (não instala)
-  spell install <pacote...>     # build + package + install (com DESTDIR)
-  spell remove <pacote...>      # desinstala (ordem reversa)
-  spell search <regex>          # busca em receitas
-  spell upgrade [<pacote...>]   # rebuild + install (default: todos instalados)
-  spell clean                   # limpa diretórios de trabalho/cache antigos
-  spell orphans                 # lista órfãos (auto e não necessários)
-  spell mark-auto <pacote...>   # marca como instalado automaticamente
-  spell fix                     # correções de banco/manifests
-  spell sync                    # sincroniza receitas+db com repo git (SPELL_GIT_REPO)
+Comandos principais:
+  init                          Inicializa diretórios
+  create <nome>                 Cria esqueleto de fórmula
+  fetch <pkg>                   Baixa fonte (curl/git)
+  unpack <pkg>                  Descompacta para workdir
+  patch <pkg>                   Aplica patches
+  build <pkg>                   Compila e prepara DESTDIR
+  bin   <pkg>                   Gera pacote binário (tar.zst)
+  install <pkg>                 Compila e instala (com DESTDIR/fakeroot)
+  install-order <pkgs...>       Instala com resolução topológica (deps primeiro)
+  remove <pkg>                  Remove pacote instalado
+  remove-order <pkgs...>        Remove em ordem reversa
+  search <texto>                Procura por fórmulas
+  info <pkg>                    Informações do pacote
+  list                          Lista instalados
+  upgrade <pkg|--all>           Atualiza para a versão da fórmula
+  sync                          Sincroniza estado para repo git
+  clean [build|src|bin|all]     Limpa diretórios de trabalho
 
+Opções de ambiente:
+  SPELL_COLOR=0 desativa cores; SPELL_SPINNER=0 desativa spinner
 Diretórios:
-  ROOT:     $SPELL_ROOT
-  recipes:  $SPELL_RECIPES_DIR
-  build:    $SPELL_BUILD_ROOT
-  src:      $SPELL_SRC_CACHE
-  pkgs:     $SPELL_PKG_DIR
-  db:       $SPELL_DB_DIR
-  logs:     $SPELL_LOG_DIR
-
-Variáveis úteis:
-  SPELL_PREFIX, SPELL_JOBS, SPELL_COLOR, SPELL_SPINNER, DESTDIR_BASE, SPELL_GIT_REPO, SPELL_SUDO
-
-Receita YAML mínima (exemplo):
---------------------------------
-# Salve como: $SPELL_RECIPES_DIR/hello.yaml
-name: hello
-version: 2.12
-description: GNU Hello
-homepage: https://www.gnu.org/software/hello/
-license: GPL-3.0
-source:
-  type: url
-  url: https://ftp.gnu.org/gnu/hello/hello-2.12.tar.xz
-# patches: []
-depends:
-  - libc
-build: |
-  ./configure --prefix="${SPELL_PREFIX}"
-  make -j"${SPELL_JOBS}"
-install: |
-  make DESTDIR="${DESTDIR}" install
---------------------------------
-
-Dicas:
-- Para usar fakeroot: instale fakeroot (opcional). Se presente, será usado.
-- Para Sync git: exporte SPELL_GIT_REPO=/caminho/do/repo e rode `spell sync`.
-- Para remover órfãos: `spell orphans | xargs -r spell remove` (use com cuidado).
+  Fórmulas: $SPELL_FORMULAE
+  Estado:   $SPELL_HOME
 EOF
 }
 
+cmd_list() { ls -1 "$SPELL_DB" 2>/dev/null || true; }
+
 main() {
-  cmd="${1:-}"; shift || true
-  case "$cmd" in
-    build)    cmd_build "$@" ;;
-    install)  cmd_install "$@" ;;
-    remove)   cmd_remove "$@" ;;
-    search)   cmd_search "${1:-}" ;;
-    upgrade)  cmd_upgrade "$@" ;;
-    clean)    cmd_clean ;;
-    orphans)  cmd_orphans ;;
-    mark-auto) cmd_mark_auto "$@" ;;
-    fix)      cmd_fix ;;
-    sync)     cmd_sync ;;
-    ""|-h|--help|help) usage ;;
-    *) err "Comando inválido: $cmd"; usage; exit 2;;
+  local cmd="${1:-}"; shift || true
+  case "${cmd}" in
+    init) ok "Spell inicializado em $SPELL_HOME";;
+    create) scaffold "$@";;
+    fetch) fetch_source "$@";;
+    unpack) unpack_to_workdir "$@";;
+    patch) apply_patches "$@";;
+    build) build_package "$@" >/dev/null;;
+    bin) make_binary "$@";;
+    install) install_from_source "$@";;
+    install-order) install_with_deps "$@";;
+    remove) remove_package "$@";;
+    remove-order) remove_with_reverse_deps "$@";;
+    search) cmd_search "${1:-}";;
+    info) cmd_info "$@";;
+    list) cmd_list;;
+    upgrade)
+      if [[ "${1:-}" == "--all" ]]; then
+        for f in "$SPELL_FORMULAE"/*.spell; do [[ -e "$f" ]] || continue; n=$(basename "$f" .spell); upgrade_one "$n"; done
+      else
+        upgrade_one "$@"
+      fi
+      ;;
+    sync) git_sync ;;
+    clean) clean "${1:-build}" ;;
+    ""|help|-h|--help) usage ;;
+    *) err "Comando desconhecido: $cmd"; usage; exit 1 ;;
   esac
 }
 
 main "$@"
-
-# Fim do arquivo
